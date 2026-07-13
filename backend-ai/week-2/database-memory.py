@@ -1,7 +1,15 @@
 import os
 import flask
 from flask import Flask, request, jsonify
-from database import create_table, insert_data, populate_random_data, get_all_data, get_data_by_id, update_data, delete_data, delete_all_data
+from database_client import create_table, insert_data, populate_random_data, get_all_data, get_data_by_id, update_data, delete_data, delete_all_data
+from redis_client import (
+    get_data as redis_get_data, 
+    get_all_data as redis_get_all_data, 
+    set_data as redis_set_data, 
+    delete_data as redis_delete_data, 
+    update_data as redis_update_data, 
+    insert_random_data as redis_insert_random_data
+)
 from dotenv import load_dotenv
 load_dotenv()
 import logging
@@ -54,7 +62,28 @@ def data():
         data = request.get_json()
         delete_data(data['id'])
         return jsonify({'message': 'Data deleted successfully'}), 200
-    
+
+@app.route('/redis-data', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def redis_data():
+    if request.method == 'GET':
+        data=redis_get_all_data()
+        return flask.jsonify(data), 200
+    elif request.method == 'POST':
+        data = request.get_json(silent=True) or request.form
+        key = data.get('key')
+        value = data.get('value')
+        if not all([key, value]):
+            return jsonify({'error': 'key and value are required'}), 400
+        redis_set_data(key, value)
+        return jsonify({'message': 'Data inserted successfully'}), 201
+    elif request.method == 'PUT':
+        data = request.get_json()
+        redis_update_data(data['key'], data['value'])
+        return jsonify({'message': 'Data updated successfully'}), 200
+    elif request.method == 'DELETE':
+        data = request.get_json()
+        redis_delete_data(data['key'])
+        return jsonify({'message': 'Data deleted successfully'}), 200
     
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
