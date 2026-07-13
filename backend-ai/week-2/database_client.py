@@ -1,6 +1,6 @@
 import os
 import random
-
+import time
 import psycopg2
 from dotenv import load_dotenv
 
@@ -114,9 +114,27 @@ def delete_all_data():
     with conn.cursor() as cursor:
         cursor.execute("DELETE FROM data;")
 
+def add_index_to_table():
+    with conn.cursor() as cursor:
+        cursor.execute("CREATE INDEX idx_department ON data (department);")
+        cursor.execute("CREATE INDEX idx_name ON data (name);")
+        pass
+
+def measure_query_time(conn, name):
+    start_time = time.time()
+    with conn.cursor() as cursor:
+        cursor.execute("EXPLAIN ANALYZE SELECT * FROM data WHERE department = 'CSE' AND name = %s;", (name,))
+        result = cursor.fetchall()
+    end_time = time.time()
+    execution_time = end_time - start_time
+    return execution_time, result
+
 if __name__ == "__main__":
     create_table()
-    populate_random_data(10)
+    populate_random_data(100)
+    # add_index_to_table()
     print(get_all_data())
     print(get_data_by_id(1))
+    execution_time, result = measure_query_time(conn, 'Alice')
+    print(f"Execution time for name 'Alice': {execution_time:.6f} seconds")
     print("Database initialized successfully.")
