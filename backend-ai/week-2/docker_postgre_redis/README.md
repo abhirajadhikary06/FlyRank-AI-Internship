@@ -6,27 +6,23 @@ In Week 2, we extended the Week 1 Flask application by replacing the in-memory/C
 
 # Features Implemented
 
-- **Home Route (`/`)**
+- **Home Route** (`/`)
   - Returns a welcome message indicating the server is running.
 
-- **Health Check (`/status`)**
+- **Health Check** (`/status`)
   - Returns a JSON response confirming the application is healthy.
 
-- **PostgreSQL CRUD API (`/data`)**
+- **PostgreSQL CRUD API** (`/data`)
   - Create student records.
   - Retrieve student records.
   - Update student records.
   - Delete student records.
 
-- **Redis CRUD API (`/redis-data`)**
+- **Redis CRUD API** (`/redis-data`)
   - Store key-value pairs.
   - Retrieve stored key-value pairs.
   - Update existing values.
   - Delete keys.
-
-- **Swagger UI**
-  - API documentation.
-  - Interactive endpoint testing.
 
 - **Docker Support**
   - `Dockerfile`
