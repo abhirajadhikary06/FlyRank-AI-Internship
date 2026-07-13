@@ -1,0 +1,5 @@
+requests
+response
+flask
+gunicorn
+psycopg2-binary
