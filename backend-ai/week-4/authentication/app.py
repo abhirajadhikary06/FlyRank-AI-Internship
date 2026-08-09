@@ -1,47 +1,87 @@
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.responses import RedirectResponse
-from sqlalchemy import create_engine, Column, Integer, String, Boolean
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from pydantic import BaseModel, Field
-from typing import List
-import uvicorn
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, ExpiredSignatureError, jwt
+from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
-from jose import JWTError, jwt
-from datetime import datetime, timedelta
-from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# Creating the SQLite database
-DATABASE_URL = "sqlite:///./users.db"
+# ---------------------------
+# Load environment variables
+# ---------------------------
+load_dotenv()
 
-# Database engine and session setup
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}) # Engine
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine) # Database Session
-Base = declarative_base() # parent class of SQLAlchemy models
+DATABASE_URL = os.getenv("DATABASE_URL")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 
-# Defining the User model
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is missing in .env")
+
+# ---------------------------
+# Database setup
+# ---------------------------
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# ---------------------------
+# FastAPI app
+# ---------------------------
+app = FastAPI(
+    title="Auth API with FastAPI + Neon",
+    description="Secure authentication API with signup, login, logout, public and protected routes.",
+    version="1.0.0"
+)
+
+# ---------------------------
+# Security
+# ---------------------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+token_blacklist = set()
+
+# ---------------------------
+# Database model
+# ---------------------------
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    password = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True)
 
-# Create the table in database
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    hashed_password = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+# Create tables
 Base.metadata.create_all(bind=engine)
 
-class UserCreate(BaseModel):
-    username: str = Field(min_length=4, max_length=20)
-    password: str = Field(min_length=8)
+# ---------------------------
+# Pydantic schemas
+# ---------------------------
+class AuthRequest(BaseModel):
+    email: EmailStr
+    password: str
 
-class UserRead(BaseModel):
+class UserResponse(BaseModel):
     id: int
-    username: str
-    is_active: bool
+    email: EmailStr
+    created_at: datetime
 
-    class Config:
-        from_attributes = True
+class LoginResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
 
-# This function creates a new database session for each request
+# ---------------------------
+# Dependencies
+# ---------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -49,91 +89,190 @@ def get_db():
     finally:
         db.close()
 
-app = FastAPI()
+# ---------------------------
+# Helper functions
+# ---------------------------
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-# Home route
-@app.get("/")
-def home():
-    return {"message": "Welcome to the FastAPI application! - Week3 - FlyRank AI Internship"}
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
-# Get all users
-@app.get("/users", response_model=List[UserRead])
-def read_users(db: Session = Depends(get_db)):
-    users = db.query(User).all()
-    return users
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (
+        expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# Create a user
-@app.post("/users", response_model=UserRead)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = User(username=user.username, password=user.password)
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+def create_refresh_token(data: dict):
+    expire = datetime.now(timezone.utc) + timedelta(days=7)
+    to_encode = data.copy()
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# Get a user by ID
-@app.get("/users/{user_id}", response_model=UserRead)
-def read_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == user_id).first()
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    token = credentials.credentials
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token required"
+        )
+
+    if token in token_blacklist:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        token_type = payload.get("type")
+
+        if email is None or token_type != "access":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token"
+            )
+
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+
+    user = db.query(User).filter(User.email == email).first()
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
 
-# Update a user by ID
-@app.put("/users/{user_id}", response_model=UserRead)
-def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.id == user_id).first()
-    if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    db_user.username = user.username
-    db_user.password = user.password
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+    return user, token
 
-# Delete a user by ID
-@app.delete("/users/{user_id}")
-def delete_user(user_id: int, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.id == user_id).first()
-    if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    db.delete(db_user)
-    db.commit()
-    return {"message": "User deleted successfully"}
+# ---------------------------
+# Stage 1: Signup
+# ---------------------------
+@app.post("/auth/signup", status_code=201)
+def signup(payload: AuthRequest, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    password = payload.password.strip()
 
-# Login
-@app.post("/login")
-def login(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.username == user.username, User.password == user.password).first()
-    if db_user is None:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-    return RedirectResponse(url=f"/profile?user_id={db_user.id}")
+    if not email or not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email and password are required"
+        )
 
-# Logout
-@app.post("/logout")
-def logout():
-    return RedirectResponse(url="/")
+    existing_user = db.query(User).filter(User.email == email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User already exists"
+        )
 
-# Profile Route
-@app.get("/profile")
-def profile(user_id: int, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.id == user_id).first()
-    if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"username": db_user.username, "is_active": db_user.is_active}
+    new_user = User(
+        email=email,
+        hashed_password=hash_password(password)
+    )
 
-# Register
-@app.post("/register", response_model=UserRead)
-def register(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.username == user.username).first()
-    if db_user:
-        raise HTTPException(status_code=400, detail="Username already registered")
-    new_user = User(username=user.username, password=user.password)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    return new_user
 
-# Run the application
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {
+        "message": "User created successfully",
+        "user": {
+            "id": new_user.id,
+            "email": new_user.email,
+            "created_at": new_user.created_at
+        }
+    }
+
+# ---------------------------
+# Stage 1: Login
+# ---------------------------
+@app.post("/auth/login", status_code=200, response_model=LoginResponse)
+def login(payload: AuthRequest, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    password = payload.password.strip()
+
+    if not email or not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email and password are required"
+        )
+
+    user = db.query(User).filter(User.email == email).first()
+
+    if not user or not verify_password(password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid login credentials"
+        )
+
+    access_token = create_access_token({"sub": user.email, "user_id": user.id})
+    refresh_token = create_refresh_token({"sub": user.email, "user_id": user.id})
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+# ---------------------------
+# Stage 2: Public route
+# ---------------------------
+@app.get("/public/info", status_code=200)
+def public_info():
+    return {"message": "Welcome stranger! This info is public."}
+
+# ---------------------------
+# Stage 2/3/4: Protected profile
+# ---------------------------
+@app.get("/protected/profile", status_code=200)
+def protected_profile(current=Depends(get_current_user)):
+    user, _token = current
+    return {
+        "id": user.id,
+        "email": user.email,
+        "created_at": user.created_at
+    }
+
+# ---------------------------
+# Stage 4: Another protected route
+# ---------------------------
+@app.get("/protected/dashboard", status_code=200)
+def protected_dashboard(current=Depends(get_current_user)):
+    user, _token = current
+    return {
+        "message": f"Welcome to your dashboard, {user.email}",
+        "user_id": user.id
+    }
+
+# ---------------------------
+# Stage 4: Logout
+# ---------------------------
+@app.post("/auth/logout", status_code=204)
+def logout(current=Depends(get_current_user)):
+    _user, token = current
+    token_blacklist.add(token)
+    return
+
+# ---------------------------
+# Root route
+# ---------------------------
+@app.get("/")
+def root():
+    return {"message": "Server running and connected to Neon"}
