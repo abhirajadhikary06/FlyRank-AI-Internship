@@ -10,6 +10,7 @@ from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.exc import SQLAlchemyError
 
 # ---------------------------
 # Load environment variables
@@ -17,17 +18,24 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
+SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is missing in .env")
 
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY is missing in .env")
+
 # ---------------------------
 # Database setup
 # ---------------------------
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -44,8 +52,10 @@ app = FastAPI(
 # Security
 # ---------------------------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
+# In-memory blacklist for logout
+# Note: fine for demo/internship, but not persistent across restarts
 token_blacklist = set()
 
 # ---------------------------
@@ -55,8 +65,8 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, nullable=False, index=True)
-    hashed_password = Column(String, nullable=False)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 # Create tables
@@ -96,7 +106,10 @@ def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception:
+        return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -112,18 +125,20 @@ def create_refresh_token(data: dict):
     to_encode.update({"exp": expire, "type": "refresh"})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-):
-    token = credentials.credentials
-
-    if not token:
+def get_token_from_header(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> str:
+    if credentials is None or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Access token required"
         )
+    return credentials.credentials
 
+def get_current_user(
+    token: str = Depends(get_token_from_header),
+    db: Session = Depends(get_db)
+):
     if token in token_blacklist:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -135,7 +150,7 @@ def get_current_user(
         email = payload.get("sub")
         token_type = payload.get("type")
 
-        if email is None or token_type != "access":
+        if not email or token_type != "access":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired token"
@@ -152,7 +167,14 @@ def get_current_user(
             detail="Invalid or expired token"
         )
 
-    user = db.query(User).filter(User.email == email).first()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error"
+        )
+
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -166,70 +188,100 @@ def get_current_user(
 # ---------------------------
 @app.post("/auth/signup", status_code=201)
 def signup(payload: AuthRequest, db: Session = Depends(get_db)):
-    email = payload.email.strip().lower()
-    password = payload.password.strip()
+    try:
+        email = payload.email.strip().lower()
+        password = payload.password.strip()
 
-    if not email or not password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email and password are required"
+        if not email or not password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email and password are required"
+            )
+
+        existing_user = db.query(User).filter(User.email == email).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User already exists"
+            )
+
+        new_user = User(
+            email=email,
+            hashed_password=hash_password(password)
         )
 
-    existing_user = db.query(User).filter(User.email == email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User already exists"
-        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
 
-    new_user = User(
-        email=email,
-        hashed_password=hash_password(password)
-    )
-
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-
-    return {
-        "message": "User created successfully",
-        "user": {
-            "id": new_user.id,
-            "email": new_user.email,
-            "created_at": new_user.created_at
+        return {
+            "message": "User created successfully",
+            "user": {
+                "id": new_user.id,
+                "email": new_user.email,
+                "created_at": new_user.created_at
+            }
         }
-    }
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error while creating user"
+        )
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
 
 # ---------------------------
 # Stage 1: Login
 # ---------------------------
 @app.post("/auth/login", status_code=200, response_model=LoginResponse)
 def login(payload: AuthRequest, db: Session = Depends(get_db)):
-    email = payload.email.strip().lower()
-    password = payload.password.strip()
+    try:
+        email = payload.email.strip().lower()
+        password = payload.password.strip()
 
-    if not email or not password:
+        if not email or not password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email and password are required"
+            )
+
+        user = db.query(User).filter(User.email == email).first()
+
+        if not user or not verify_password(password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid login credentials"
+            )
+
+        access_token = create_access_token({"sub": user.email, "user_id": user.id})
+        refresh_token = create_refresh_token({"sub": user.email, "user_id": user.id})
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email and password are required"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error while logging in"
         )
-
-    user = db.query(User).filter(User.email == email).first()
-
-    if not user or not verify_password(password, user.hashed_password):
+    except Exception:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid login credentials"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
         )
-
-    access_token = create_access_token({"sub": user.email, "user_id": user.id})
-    refresh_token = create_refresh_token({"sub": user.email, "user_id": user.id})
-
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer"
-    }
 
 # ---------------------------
 # Stage 2: Public route
@@ -268,7 +320,7 @@ def protected_dashboard(current=Depends(get_current_user)):
 def logout(current=Depends(get_current_user)):
     _user, token = current
     token_blacklist.add(token)
-    return
+    return None
 
 # ---------------------------
 # Root route
@@ -276,3 +328,10 @@ def logout(current=Depends(get_current_user)):
 @app.get("/")
 def root():
     return {"message": "Server running and connected to Neon"}
+
+# ---------------------------
+# Startup event
+# ---------------------------
+@app.on_event("startup")
+def startup_event():
+    print("Server running and connected to Neon")
